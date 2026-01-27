@@ -1,0 +1,518 @@
+from web3 import Web3
+import time
+import signal
+import sys
+import os
+from decimal import Decimal
+from eth_account import Account
+
+# ------------------------------
+# CONFIGURATION
+# ------------------------------
+RPC_URL = "https://rpc.pulsechain.com"
+PRIVATE_KEY = os.environ["KEY"]
+ACCOUNT = Web3.to_checksum_address("0x83FB98BD2C8DC33f2c150C0CAF5935d1f2EbFEc9")
+
+# Contracts
+TOKEN_ADDRESS = Web3.to_checksum_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")  # USDC
+MULTIMATH_ADDRESS = Web3.to_checksum_address("0xD294024c5e71B3C1270aE68bb5E4977Bdb69d3B2")
+SPENDER_ADDRESS = MULTIMATH_ADDRESS
+
+# ✅ USDC has 6 decimals
+TOKEN_DECIMALS = 6
+
+# Loops
+LOOPS = int(sys.argv[2]) if len(sys.argv) > 2 else 1100
+
+# Max batch size for gas estimation (to avoid huge estimation calls)
+MAX_ESTIMATION_BATCH = 100
+
+# PLS Ratio per 1000 loops (from command-line)
+# Example: ratio of 5 means 5000 PLS max for 1000 loops, 5500 PLS max for 1100 loops
+PLS_RATIO = float(sys.argv[1]) if len(sys.argv) > 1 else 5.0
+
+# Calculate actual threshold based on loops
+PLS_THRESHOLD = (LOOPS / 1000.0) * PLS_RATIO * 1000
+
+# Gas price multiplier for replacements (must be at least 10% higher)
+REPLACEMENT_MULTIPLIER = 1.2  # 20% increase for stuck transactions
+
+# ------------------------------
+# WEB3 SETUP
+# ------------------------------
+w3 = Web3(Web3.HTTPProvider(RPC_URL))
+account = w3.eth.account.from_key(PRIVATE_KEY)
+
+# Track pending nonce
+pending_nonce = None
+pending_gas_price = None
+
+# ------------------------------
+# ABIs
+# ------------------------------
+ERC20_ABI = [
+    {
+        "constant": True,
+        "inputs": [{"name": "_owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "balance", "type": "uint256"}],
+        "type": "function"
+    },
+    {
+        "constant": True,
+        "inputs": [
+            {"name": "_owner", "type": "address"},
+            {"name": "_spender", "type": "address"}
+        ],
+        "name": "allowance",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function"
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "symbol",
+        "outputs": [{"name": "", "type": "string"}],
+        "type": "function"
+    },
+    {
+        "name": "approve",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "spender", "type": "address"},
+            {"name": "amount", "type": "uint256"}
+        ],
+        "outputs": [{"type": "bool"}]
+    }
+]
+
+MULTIMATH_ABI = [
+    {
+        "name": "multiBuyWith",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "_address", "type": "address"},
+            {"name": "_loops", "type": "uint256"}
+        ],
+        "outputs": []
+    }
+]
+
+token = w3.eth.contract(address=TOKEN_ADDRESS, abi=ERC20_ABI)
+multimath = w3.eth.contract(address=MULTIMATH_ADDRESS, abi=MULTIMATH_ABI)
+
+# ------------------------------
+# HELPER FUNCTIONS
+# ------------------------------
+def get_nonce(w3, address):
+    """Get current nonce for address."""
+    return w3.eth.get_transaction_count(address, 'pending')
+
+def get_dynamic_gas_price(web3, for_replacement=False):
+    """Get a dynamic gas price based on network conditions."""
+    try:
+        base_gas_price = web3.eth.gas_price
+        
+        # Get the latest block to check base fee (for EIP-1559 chains)
+        try:
+            latest_block = web3.eth.get_block('latest')
+            base_fee = latest_block.get('baseFeePerGas', 0)
+            
+            if base_fee > 0:
+                # Use base fee as minimum, add significant buffer
+                gas_price = int(base_fee * 1.5)  # 50% above base fee
+                print(f"   Base fee: {base_fee/1e9:,.0f} gwei, using {gas_price/1e9:,.0f} gwei (1.5x)")
+            else:
+                # No base fee, use gas price with high multiplier
+                gas_price = int(base_gas_price * 1.5)  # 50% buffer
+                print(f"   Current gas price: {base_gas_price/1e9:,.0f} gwei, using {gas_price/1e9:,.0f} gwei (1.5x)")
+        except:
+            # Fallback to simple calculation
+            gas_price = int(base_gas_price * 1.5)  # 50% buffer
+            print(f"   Using gas price: {gas_price/1e9:,.0f} gwei (1.5x current)")
+        
+        # If replacing, increase by at least 20% (was 15%)
+        if for_replacement and pending_gas_price:
+            min_gas_price = int(pending_gas_price * 1.2)  # 20% increase for replacement
+            if gas_price < min_gas_price:
+                print(f"   Replacement: increasing to {min_gas_price/1e9:,.0f} gwei (1.2x previous)")
+                gas_price = min_gas_price
+        
+        return gas_price
+    except Exception as e:
+        print(f"❌ Failed to fetch gas price: {e}")
+        # Higher fallback for PulseChain
+        fallback = web3.to_wei('1000', 'gwei')
+        print(f"   Using fallback: {fallback/1e9:,.0f} gwei")
+        return fallback
+
+def check_balances():
+    """Check and display account balances and allowances."""
+    print("="*60)
+    print("ACCOUNT DIAGNOSTICS")
+    print("="*60)
+    
+    # Check PLS balance
+    pls_balance = w3.eth.get_balance(account.address)
+    print(f"💰 PLS Balance: {pls_balance / 1e18:,.0f} PLS")
+    
+    if pls_balance < w3.to_wei(100, 'ether'):
+        print(f"   ⚠️ WARNING: Low PLS balance for gas!")
+    
+    print()
+    
+    # Check token balance
+    try:
+        symbol = token.functions.symbol().call()
+        token_balance = token.functions.balanceOf(account.address).call()
+        print(f"🪙 Token: {symbol}")
+        print(f"   Balance: {token_balance / (10 ** TOKEN_DECIMALS):,.0f} {symbol}")
+        
+        if token_balance == 0:
+            print(f"   ⚠️ WARNING: No token balance!")
+    except Exception as e:
+        print(f"❌ Error getting token balance: {e}")
+        token_balance = 0
+        symbol = "UNKNOWN"
+    
+    print()
+    
+    # Check allowance
+    try:
+        allowance = token.functions.allowance(account.address, MULTIMATH_ADDRESS).call()
+        print(f"✅ Allowance for MultiMath contract:")
+        print(f"   Human readable: {allowance / (10 ** TOKEN_DECIMALS):,} {symbol}")
+        
+        if allowance == 0:
+            print(f"   ⚠️ WARNING: No allowance! You need to approve the contract first.")
+            return False
+        elif token_balance > 0 and allowance < token_balance:
+            print(f"   ⚠️ WARNING: Allowance ({allowance / (10 ** TOKEN_DECIMALS):,.2f}) < Balance ({token_balance / (10 ** TOKEN_DECIMALS):,.2f})!")
+            print(f"   Consider approving more tokens.")
+        else:
+            print(f"   ✅ Allowance is sufficient")
+    except Exception as e:
+        print(f"❌ Error checking allowance: {e}")
+        return False
+    
+    print("="*60)
+    print()
+    return True
+
+def approve_token(amount):
+    """Approve token spending."""
+    print(f"\n{'='*60}")
+    print(f"APPROVING TOKENS")
+    print(f"{'='*60}")
+    print(f"Amount: {amount / (10 ** TOKEN_DECIMALS):,.6f}")
+    print(f"Spender: {SPENDER_ADDRESS}")
+    print()
+    
+    gas_price = get_dynamic_gas_price(w3)
+    
+    # Build transaction
+    tx = token.functions.approve(SPENDER_ADDRESS, amount).build_transaction({
+        "from": account.address,
+        "gas": 100_000,
+        "gasPrice": gas_price
+    })
+    
+    receipt = send_transaction(tx)
+    
+    if receipt:
+        print("✅ Token approval successful!")
+        print(f"{'='*60}\n")
+    
+    return receipt
+
+def check_pending_transactions():
+    """Check if there are pending transactions and wait for them."""
+    global pending_nonce
+    
+    current_nonce = w3.eth.get_transaction_count(account.address, 'latest')
+    pending_count = w3.eth.get_transaction_count(account.address, 'pending')
+    
+    if pending_count > current_nonce:
+        print(f"⏳ Waiting for {pending_count - current_nonce} pending transaction(s) (nonce {current_nonce})")
+        
+        # Wait for pending txs to clear
+        max_wait = 60  # Wait up to 60 seconds
+        for i in range(max_wait):
+            time.sleep(1)
+            new_pending = w3.eth.get_transaction_count(account.address, 'pending')
+            if new_pending == w3.eth.get_transaction_count(account.address, 'latest'):
+                print("✅ Pending transactions cleared")
+                pending_nonce = None
+                return True
+        
+        print("⚠️ Timeout waiting for pending transactions")
+        return False
+    
+    pending_nonce = None
+    return True
+
+def send_transaction(tx, is_replacement=False):
+    """Sign and send transaction."""
+    global pending_nonce, pending_gas_price
+    
+    nonce = get_nonce(w3, account.address)
+    tx["nonce"] = nonce
+    tx["chainId"] = w3.eth.chain_id
+    
+    # Display transaction details before sending
+    print(f"\n{'─'*60}")
+    print(f"📤 SENDING TRANSACTION")
+    print(f"{'─'*60}")
+    print(f"🔢 Nonce:             {nonce}")
+    print(f"🔗 Chain ID:          {tx['chainId']}")
+    print(f"⛽ Gas Limit:         {tx.get('gas', 'N/A'):,}")
+    print(f"💰 Gas Price:         {tx.get('gasPrice', 0)/1e9:,.0f} gwei")
+    
+    # Calculate and show estimated cost
+    if 'gas' in tx and 'gasPrice' in tx:
+        estimated_cost = Decimal(tx['gas']) * Decimal(tx['gasPrice']) / Decimal(1e18)
+        print(f"💵 Estimated Cost:    {estimated_cost:,.0f} PLS")
+    print(f"{'─'*60}")
+    
+    try:
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        print(f"✅ TX sent: {tx_hash.hex()}")
+        
+        # Track this nonce and gas price
+        pending_nonce = nonce
+        pending_gas_price = tx.get('gasPrice')
+        
+        print(f"⏳ Waiting for confirmation...")
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        
+        # Calculate actual cost
+        actual_gas_used = receipt.gasUsed
+        actual_gas_price = receipt.effectiveGasPrice
+        actual_pls_cost = Decimal(actual_gas_used) * Decimal(actual_gas_price) / Decimal(1e18)
+        
+        print(f"\n{'='*60}")
+        print(f"✅ TRANSACTION CONFIRMED")
+        print(f"{'='*60}")
+        print(f"📦 Block Number:      {receipt.blockNumber:,}")
+        print(f"⛽ Gas Used:          {actual_gas_used:,}")
+        print(f"💰 Gas Price:         {actual_gas_price/1e9:,.2f} gwei")
+        print(f"💵 Actual PLS Cost:   {actual_pls_cost:,.6f} PLS")
+        
+        # Show savings/overpay vs estimate if we have the original tx
+        if 'gas' in tx:
+            estimated_pls = Decimal(tx['gas']) * Decimal(tx['gasPrice']) / Decimal(1e18)
+            difference = estimated_pls - actual_pls_cost
+            if difference > 0:
+                print(f"💚 Saved:             {difference:,.6f} PLS vs estimate")
+            elif difference < 0:
+                print(f"💸 Over estimate by:  {abs(difference):,.6f} PLS")
+        
+        print(f"{'='*60}\n")
+        
+        # Clear pending tracking
+        pending_nonce = None
+        pending_gas_price = None
+        
+        return receipt
+    except Exception as e:
+        error_msg = str(e)
+        
+        # Handle replacement errors
+        if 'could not replace existing tx' in error_msg or 'replacement transaction underpriced' in error_msg:
+            print(f"⚠️ Replacement error: {error_msg}")
+            return None
+        
+        # Handle other errors
+        print(f"❌ Transaction failed: {error_msg}")
+        pending_nonce = None
+        pending_gas_price = None
+        return None
+
+def call_multibuy_with(token_address, loops):
+    """Build multiBuyWith tx and wait if gas cost > threshold."""
+    global pending_nonce, pending_gas_price
+    
+    # Check for pending transactions first
+    if not check_pending_transactions():
+        print("⏭️ Skipping this iteration due to pending transactions")
+        time.sleep(5)
+        return None
+    
+    while True:
+        # Check if we're trying to replace a pending tx
+        current_nonce = get_nonce(w3, account.address)
+        is_replacement = (pending_nonce is not None and pending_nonce == current_nonce)
+        
+        # Get current gas price with detailed logging
+        print(f"\n💰 Fetching gas price...")
+        gas_price = get_dynamic_gas_price(w3, for_replacement=is_replacement)
+        print(f"✅ Using gas price: {gas_price/1e9:,.0f} gwei\n")
+        
+        # Safe gas estimation using batch scaling
+        gas_limit = None
+        try:
+            # If loops is large, estimate with a smaller batch and scale up
+            if loops > MAX_ESTIMATION_BATCH:
+                print(f"📊 Loops ({loops:,}) > max estimation batch ({MAX_ESTIMATION_BATCH:,})")
+                print(f"📊 Estimating gas for {MAX_ESTIMATION_BATCH:,} loops and scaling...")
+                
+                # Build transaction with small batch
+                tx_small = multimath.functions.multiBuyWith(token_address, MAX_ESTIMATION_BATCH).build_transaction({
+                    "from": account.address,
+                    "gasPrice": gas_price
+                })
+                
+                # Get gas estimate for small batch
+                estimated_gas_small = tx_small.get('gas', 0)
+                if estimated_gas_small == 0:
+                    # If auto-estimation didn't work, try manual
+                    raise Exception("Auto-estimation returned 0")
+                
+                # Scale up linearly
+                scale_factor = loops / MAX_ESTIMATION_BATCH
+                gas_limit = int(estimated_gas_small * scale_factor * 1.2)  # Add 20% buffer
+                
+                print(f"   Small batch gas: {estimated_gas_small:,}")
+                print(f"   Scale factor: {scale_factor:.2f}x")
+                print(f"   Scaled gas (with 20% buffer): {gas_limit:,}")
+            else:
+                # Small enough to estimate directly
+                print(f"📊 Estimating gas for {loops:,} loops directly...")
+                tx_direct = multimath.functions.multiBuyWith(token_address, loops).build_transaction({
+                    "from": account.address,
+                    "gasPrice": gas_price
+                })
+                gas_limit = tx_direct.get('gas', 0)
+                if gas_limit == 0:
+                    raise Exception("Auto-estimation returned 0")
+                
+                # Add 20% buffer
+                gas_limit = int(gas_limit * 1.2)
+                print(f"   Direct estimate (with 20% buffer): {gas_limit:,}")
+        
+        except Exception as e:
+            print(f"⚠️ Gas estimation failed: {e}")
+            print(f"⚠️ Using fallback calculation...")
+            
+            # Fallback: assume ~2700 gas per loop (typical for token operations)
+            gas_per_loop = 2700
+            gas_limit = int(loops * gas_per_loop * 1.3)  # 30% buffer for safety
+            print(f"   Fallback: {gas_per_loop:,} gas/loop × {loops:,} loops × 1.3 = {gas_limit:,}")
+        
+        # Build final transaction with calculated gas limit
+        try:
+            tx = multimath.functions.multiBuyWith(token_address, loops).build_transaction({
+                "from": account.address,
+                "gas": gas_limit,
+                "gasPrice": gas_price
+            })
+            print(f"✅ Transaction built successfully")
+        except Exception as e:
+            print(f"❌ Transaction build failed: {e}")
+            print("Running diagnostics...")
+            check_balances()
+            time.sleep(5)
+            return None
+        
+        # Calculate estimated PLS cost
+        estimated_pls = Decimal(tx['gas']) * Decimal(gas_price) / Decimal(1e18)
+        
+        # Display detailed gas info
+        replacement_text = " [REPLACEMENT]" if is_replacement else ""
+        print(f"\n{'─'*60}")
+        print(f"📋 Transaction Details (Nonce {current_nonce}{replacement_text})")
+        print(f"{'─'*60}")
+        print(f"⛽ Gas Limit:          {tx['gas']:,}")
+        print(f"💰 Gas Price:         {gas_price/1e9:,.0f} gwei")
+        print(f"💵 Estimated Cost:    {estimated_pls:,.0f} PLS")
+        
+        # Calculate in USD equivalent if desired (optional)
+        estimated_usd = float(estimated_pls) * 0.00001  # Rough estimate, adjust as needed
+        print(f"💲 Estimated Cost:    ~${estimated_usd:,.2f} USD (estimated)")
+        print(f"{'─'*60}\n")
+        
+        # Check threshold
+        if estimated_pls > Decimal(PLS_THRESHOLD):
+            print(f"⚠️ Estimated PLS {estimated_pls:,.0f} > threshold {PLS_THRESHOLD:,}. Waiting 5s...")
+            time.sleep(5)
+            continue
+        
+        # Send TX
+        receipt = send_transaction(tx, is_replacement)
+        
+        # If replacement failed, wait and let pending tx complete
+        if receipt is None and is_replacement:
+            print("⏳ Waiting for pending transaction to complete...")
+            time.sleep(10)
+            check_pending_transactions()
+            return None
+        
+        return receipt
+
+# ------------------------------
+# CTRL‑C HANDLER
+# ------------------------------
+def signal_handler(sig, frame):
+    print("\n👋 Stopped by user.")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+# ------------------------------
+# MAIN SCRIPT
+# ------------------------------
+if __name__ == "__main__":
+    print(f"\n{'='*60}")
+    print(f"🔗 PULSECHAIN MULTIBUY BOT")
+    print(f"{'='*60}")
+    print(f"👤 Account: {account.address}")
+    print(f"🔢 Chain ID: {w3.eth.chain_id}")
+    print(f"🔄 Loops per TX: {LOOPS:,}")
+    print(f"📏 Max Estimation Batch: {MAX_ESTIMATION_BATCH:,}")
+    print(f"📊 PLS Ratio: {PLS_RATIO:,.1f} (per 1000 loops)")
+    print(f"💰 PLS Threshold: {PLS_THRESHOLD:,.0f} PLS")
+    
+    # Calculate Affection (100,000M PLS for numloops*100000/ratio Affection)
+    affection = (LOOPS * 100000) / PLS_RATIO
+    print(f"💝 Affection: {affection:,.0f} (100,000M PLS)")
+    print(f"{'='*60}\n")
+    
+    # Run initial diagnostics
+    print("Running initial diagnostics...\n")
+    balances_ok = check_balances()
+    
+    if not balances_ok:
+        response = input("\n⚠️ Issues detected. Do you want to approve tokens? (yes/no): ")
+        if response.lower() in ['yes', 'y']:
+            # Approve a large amount
+            approve_amount = 1_000_000 * (10 ** TOKEN_DECIMALS)  # 1M tokens
+            approve_token(approve_amount)
+            # Re-check balances
+            check_balances()
+        else:
+            print("❌ Cannot proceed without proper approvals. Exiting.")
+            sys.exit(1)
+    
+    # Check for pending transactions at startup
+    check_pending_transactions()
+    
+    print("\n🚀 Starting multibuy loop...\n")
+    
+    # Loop multiBuyWith
+    iteration = 0
+    while True:
+        iteration += 1
+        print(f"\n{'='*60}")
+        print(f"Iteration #{iteration}")
+        print(f"{'='*60}")
+        
+        receipt = call_multibuy_with(TOKEN_ADDRESS, LOOPS)
+        if receipt:
+            print(f"🎉 Iteration #{iteration} complete!")
+        else:
+            print("⏭️ Skipping to next iteration")
+        
+        time.sleep(2)  # Wait 2 seconds between attempts
