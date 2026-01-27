@@ -21,7 +21,8 @@ MATH_TOKEN = Web3.to_checksum_address("0xB680F0cc810317933F234f67EB6A9E923407f05
 # Inputs from CLI
 PLS_RATIO = float(sys.argv[1]) if len(sys.argv) > 1 else 5.0
 LOOPS = int(sys.argv[2]) if len(sys.argv) > 2 else 500
-PLS_THRESHOLD = (LOOPS*3 / 1000.0) * PLS_RATIO * 1000
+# Threshold is compared against the TOTAL cost of both txs
+PLS_THRESHOLD = (LOOPS * 3 / 1000.0) * PLS_RATIO * 1000
 
 # Global Session Stats
 session_affection_total = 0
@@ -75,49 +76,25 @@ def ensure_approvals():
             w3.eth.wait_for_transaction_receipt(tx_hash)
             print(f"✅ {name} Approved.")
 
-# ... [Keep previous imports and setup] ...
-
-def execute_function(func_name, *args):
-    global session_affection_total
-    nonce = w3.eth.get_transaction_count(ACCOUNT_ADDRESS, 'latest')
-    params = get_gas_params()
-    
-    # 1. Precise Gas Estimation
+def get_estimation(func_name):
     try:
-        # Estimate based on a smaller batch to find the "per-loop" cost
         est_batch = min(LOOPS, 100)
         if func_name == "multiGenerate":
             raw_est = main_contract.functions.multiGenerate(est_batch).estimate_gas({'from': ACCOUNT_ADDRESS})
         else:
             raw_est = main_contract.functions.multiBuyWith(MATH_TOKEN, est_batch).estimate_gas({'from': ACCOUNT_ADDRESS})
-            
         exec_only = raw_est - 21000
-        gas_limit = int((21000 + (exec_only / est_batch) * LOOPS) * 1.1)
+        return int((21000 + (exec_only / est_batch) * LOOPS) * 1.1)
     except:
-        gas_limit = LOOPS * 4500 # Fallback safety limit
+        return LOOPS * 4500
 
-    # 2. CALCULATION & COMPARISON BLOCK
-    max_fee_gwei = params['maxFeePerGas'] / 1e9
-    est_total_pls = (gas_limit * params['maxFeePerGas']) / 1e18
-    
-    print(f"\n🔍 --- {func_name} Pre-Flight Check ---")
-    print(f"⛽ Gas Limit:       {gas_limit:,}")
-    print(f"💹 Max Fee Rate:    {max_fee_gwei:,.2f} Gwei")
-    print(f"📊 Estimated Cost:  {est_total_pls:.4f} PLS")
-    print(f"🛡️ Your Threshold:  {PLS_THRESHOLD:.4f} PLS")
-    
-    if est_total_pls*0.5 > PLS_THRESHOLD:
-        diff = est_total_pls - PLS_THRESHOLD
-        print(f"🛑 SKIPPED: Transaction cost is {diff:.4f} PLS over your limit.")
-        print(f"{'─'*40}")
-        return False
-    else:
-        print(f"✅ WITHIN LIMIT: Proceeding with execution...")
-        print(f"{'─'*40}")
-
-    # 3. Execution (build and sign)
+def execute_tx(func_name, gas_limit, params, nonce):
     try:
-        fn = getattr(main_contract.functions, func_name)(*args)
+        if func_name == "multiGenerate":
+            fn = main_contract.functions.multiGenerate(LOOPS)
+        else:
+            fn = main_contract.functions.multiBuyWith(MATH_TOKEN, LOOPS)
+            
         tx = fn.build_transaction({
             'from': ACCOUNT_ADDRESS,
             'nonce': nonce,
@@ -127,46 +104,81 @@ def execute_function(func_name, *args):
         })
         signed = account.sign_transaction(tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=240)
-        
-        if receipt.status == 1:
-            gwei_price = receipt.effectiveGasPrice / 1e9
-            prod_affection = LOOPS * 3
-            purchase_power = (100_000_000 / gwei_price) * LOOPS
-            session_affection_total += prod_affection
-
-            print(f"💎 SUCCESS: {prod_affection:,} Affection created.")
-            print(f"📈 Session Total: {session_affection_total:,}")
-            return True
-        return False
+        return w3.eth.wait_for_transaction_receipt(tx_hash, timeout=240)
     except Exception as e:
-        print(f"🧨 Execution Error: {e}")
-        return False
-
-# ... [Rest of the loop logic] ...
+        print(f"🧨 {func_name} Failed: {e}")
+        return None
 
 # ------------------------------
 # MAIN LOOP
 # ------------------------------
 def signal_handler(sig, frame):
-    print(f"\n👋 Shutting down. Final Session Total: {session_affection_total:,} Affection tokens.")
+    print(f"\n👋 Shutdown. Final Session Total: {session_affection_total:,} Affection.")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
 
 if __name__ == "__main__":
-    print(f"🚀 Bot Started. Target Loops: {LOOPS} | Ratio: {PLS_RATIO}")
+    print(f"🚀 Bot Started. Loops: {LOOPS} | Ratio: {PLS_RATIO} | Threshold: {PLS_THRESHOLD:.2f} PLS")
     ensure_approvals()
     
     while True:
         math_bal = math_contract.functions.balanceOf(ACCOUNT_ADDRESS).call()
         if math_bal == 0:
-            print("🏁 No MATH balance left. Bot Finished.")
+            print("🏁 No MATH balance left.")
             break
 
-        # Call sequence
-        if execute_function("multiGenerate", LOOPS):
-            execute_function("multiBuyWith", MATH_TOKEN, LOOPS)
+        # 1. Pre-Flight Summary for the Sequence
+        params = get_gas_params()
+        gen_gas = get_estimation("multiGenerate")
+        buy_gas = get_estimation("multiBuyWith")
+        total_gas = gen_gas + buy_gas
+        
+        est_total_pls = (total_gas * params['maxFeePerGas']) / 1e18
+        
+        print(f"\n🔍 --- Sequence Pre-Flight (Total for both calls) ---")
+        print(f"⛽ Combined Gas Limit: {total_gas:,}")
+        print(f"📊 Estimated Total:    {est_total_pls:.4f} PLS")
+        print(f"🛡️ Your Threshold:     {PLS_THRESHOLD:.4f} PLS")
+
+        if est_total_pls/PLS_THRESHOLD > 1.035:
+            print(f"🛑 SKIPPED: Sequence cost is {est_total_pls - PLS_THRESHOLD:.4f} PLS over limit.")
+            time.sleep(10)
+            continue
+
+        # 2. Execute Sequence
+        nonce = w3.eth.get_transaction_count(ACCOUNT_ADDRESS, 'latest')
+        
+        # Call 1
+        rec1 = execute_tx("multiGenerate", gen_gas, params, nonce)
+        if rec1 and rec1.status == 1:
+            # Call 2 (increment nonce)
+            rec2 = execute_tx("multiBuyWith", buy_gas, params, nonce + 1)
+            
+            if rec2 and rec2.status == 1:
+                # 3. Final Summary Reporting
+                total_actual_pls = ((rec1.gasUsed * rec1.effectiveGasPrice) + 
+                                    (rec2.gasUsed * rec2.effectiveGasPrice)) / 1e18
+                
+                prod_affection = LOOPS * 3
+                session_affection_total += prod_affection
+                
+                # Purchase Power Logic
+                avg_gwei = ((rec1.effectiveGasPrice + rec2.effectiveGasPrice) / 2) / 1e9
+                purchase_power = (100_000_000 / avg_gwei) * LOOPS
+
+                print(f"\n{'='*60}")
+                print(f"💎 SEQUENCE COMPLETE")
+                print(f"{'─'*60}")
+                print(f"⛽ Actual Gas Spent:   {total_actual_pls:.4f} PLS")
+                print(f"📉 Math Spent:         (Loops applied)")
+                print(f"💝 Affection Gained:   {prod_affection:,} tokens")
+                print(f"📊 Purchasing Power:   100M PLS buys {purchase_power:,.0f} tokens")
+                print(f"📈 Session Total:      {session_affection_total:,} Affection")
+                print(f"{'='*60}\n")
+            else:
+                print("⚠️ Second call failed. Sequence broken.")
+        else:
+            print("⚠️ First call failed. Sequence aborted.")
         
         time.sleep(4)
