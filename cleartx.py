@@ -2,10 +2,11 @@ import os
 import sys
 import time
 from web3 import Web3
+import sys
 
 # --- CONFIG ---
 RPC_URL = os.environ.get("RPC_URL", "https://pulsechain.publicnode.com")
-PRIVATE_KEY = os.environ.get("KEY")
+PRIVATE_KEY = os.environ.get(sys.argv[1])
 CHAIN_ID = 369 
 
 w3 = Web3(Web3.HTTPProvider(RPC_URL))

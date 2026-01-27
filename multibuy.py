@@ -15,7 +15,7 @@ PRIVATE_KEY = os.environ.get("KEY")
 ACCOUNT_ADDRESS = Web3.to_checksum_address("0xCeC3cdcbaaD459b2b7bEe596eA70A5300E5Aa834")
 
 TOKEN_ADDRESS = Web3.to_checksum_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
-MULTIMATH_ADDRESS = Web3.to_checksum_address("0xD294024c5e71B3C1270aE68bb5E4977Bdb69d3B2")
+MULTIMATH_ADDRESS = Web3.to_checksum_address("0x3dF517a0FaA3fe70ae00698451997ae596a9A711")
 TOKEN_DECIMALS = 6
 
 # Arguments
@@ -37,12 +37,11 @@ ERC20_ABI = [
     {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
     {"name": "approve", "type": "function", "stateMutability": "nonpayable", "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}], "outputs": [{"type": "bool"}]}
 ]
-MULTIMATH_ABI = [
-    {"name": "multiBuyWith", "type": "function", "stateMutability": "nonpayable", "inputs": [{"name": "_address", "type": "address"}, {"name": "_loops", "type": "uint256"}], "outputs": []}
-]
+MAIN_ABI = [{"inputs":[],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"name":"affection","outputs":[{"internalType":"contract IAffection","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"math","outputs":[{"internalType":"contract IMath","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"_loops","type":"uint256"}],"name":"multiGenerate","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_loops","type":"uint256"}],"name":"multiRandom","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"_loops","type":"uint256"}],"name":"ultimateSequence","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"_token","type":"address"}],"name":"withdrawToken","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+
 
 token = w3.eth.contract(address=TOKEN_ADDRESS, abi=ERC20_ABI)
-multimath = w3.eth.contract(address=MULTIMATH_ADDRESS, abi=MULTIMATH_ABI)
+multimath = w3.eth.contract(address=MULTIMATH_ADDRESS, abi=MAIN_ABI)
 
 # ------------------------------
 # DIAGNOSTICS
@@ -99,7 +98,7 @@ def run_multibuy(iteration):
     # Gas Estimation with Linear Scaling
     try:
         est_batch = 100
-        raw_est = multimath.functions.multiBuyWith(TOKEN_ADDRESS, est_batch).estimate_gas({'from': ACCOUNT_ADDRESS})
+        raw_est = multimath.functions.ultimateSequence(est_batch).estimate_gas({'from': ACCOUNT_ADDRESS})
         exec_only = raw_est - 21000
         gas_limit = int((21000 + (exec_only / est_batch) * LOOPS) * 1.1)
     except Exception as e:
@@ -120,7 +119,7 @@ def run_multibuy(iteration):
         return False
 
     try:
-        tx = multimath.functions.multiBuyWith(TOKEN_ADDRESS, LOOPS).build_transaction({
+        tx = multimath.functions.ultimateSequence(LOOPS).build_transaction({
             'from': ACCOUNT_ADDRESS,
             'nonce': confirmed_nonce,
             'gas': gas_limit,

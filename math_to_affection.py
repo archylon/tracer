@@ -14,7 +14,7 @@ PRIVATE_KEY = os.environ.get("KEY2")
 ACCOUNT_ADDRESS = Web3.to_checksum_address("0x24dB019d2EB8f869698Cd5F2eCfB1DA9Ff92666B")
 
 # Contract Addresses
-MAIN_CONTRACT = Web3.to_checksum_address("0xCF138a83D739eE98D7A54159E94e5BFaa4B61988")
+MAIN_CONTRACT = Web3.to_checksum_address("0x3dF517a0FaA3fe70ae00698451997ae596a9A711")
 AFFECTION_TOKEN = Web3.to_checksum_address("0x24F0154C1dCe548AdF15da2098Fdd8B8A3B8151D")
 MATH_TOKEN = Web3.to_checksum_address("0xB680F0cc810317933F234f67EB6A9E923407f05D")
 
@@ -40,10 +40,7 @@ ERC20_ABI = [
     {"constant": True, "inputs": [{"name": "_owner", "type": "address"}, {"name": "_spender", "type": "address"}], "name": "allowance", "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
     {"name": "approve", "type": "function", "stateMutability": "nonpayable", "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}], "outputs": [{"type": "bool"}]}
 ]
-MAIN_ABI = [
-    {"name": "multiGenerate", "type": "function", "stateMutability": "nonpayable", "inputs": [{"name": "loops", "type": "uint256"}], "outputs": []},
-    {"name": "multiBuyWith", "type": "function", "stateMutability": "nonpayable", "inputs": [{"name": "token", "type": "address"}, {"name": "loops", "type": "uint256"}], "outputs": []}
-]
+MAIN_ABI = [{"inputs":[],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"name":"affection","outputs":[{"internalType":"contract IAffection","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"math","outputs":[{"internalType":"contract IMath","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"_loops","type":"uint256"}],"name":"multiGenerate","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"_loops","type":"uint256"}],"name":"multiRandom","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"_loops","type":"uint256"}],"name":"ultimateSequence","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"_token","type":"address"}],"name":"withdrawToken","outputs":[],"stateMutability":"nonpayable","type":"function"}]
 
 main_contract = w3.eth.contract(address=MAIN_CONTRACT, abi=MAIN_ABI)
 math_contract = w3.eth.contract(address=MATH_TOKEN, abi=ERC20_ABI)
@@ -79,21 +76,16 @@ def ensure_approvals():
 def get_estimation(func_name):
     try:
         est_batch = min(LOOPS, 100)
-        if func_name == "multiGenerate":
-            raw_est = main_contract.functions.multiGenerate(est_batch).estimate_gas({'from': ACCOUNT_ADDRESS})
-        else:
-            raw_est = main_contract.functions.multiBuyWith(MATH_TOKEN, est_batch).estimate_gas({'from': ACCOUNT_ADDRESS})
+        raw_est = main_contract.functions.ultimateSequence(est_batch).estimate_gas({'from': ACCOUNT_ADDRESS})
         exec_only = raw_est - 21000
         return int((21000 + (exec_only / est_batch) * LOOPS) * 1.1)
     except:
         return LOOPS * 4500
 
 def execute_tx(func_name, gas_limit, params, nonce):
+    print ("Submitting TX")
     try:
-        if func_name == "multiGenerate":
-            fn = main_contract.functions.multiGenerate(LOOPS)
-        else:
-            fn = main_contract.functions.multiBuyWith(MATH_TOKEN, LOOPS)
+        fn = main_contract.functions.ultimateSequence(LOOPS)
             
         tx = fn.build_transaction({
             'from': ACCOUNT_ADDRESS,
@@ -104,6 +96,7 @@ def execute_tx(func_name, gas_limit, params, nonce):
         })
         signed = account.sign_transaction(tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        print ("TX:", tx_hash.hex())
         return w3.eth.wait_for_transaction_receipt(tx_hash, timeout=240)
     except Exception as e:
         print(f"🧨 {func_name} Failed: {e}")
@@ -130,7 +123,7 @@ if __name__ == "__main__":
 
         # 1. Pre-Flight Summary for the Sequence
         params = get_gas_params()
-        gen_gas = get_estimation("multiGenerate")
+        gen_gas = 0 #get_estimation("multiGenerate")
         buy_gas = get_estimation("multiBuyWith")
         total_gas = gen_gas + buy_gas
         
@@ -143,42 +136,39 @@ if __name__ == "__main__":
 
         if est_total_pls/PLS_THRESHOLD > 1.035:
             print(f"🛑 SKIPPED: Sequence cost is {est_total_pls - PLS_THRESHOLD:.4f} PLS over limit.")
-            time.sleep(10)
+            time.sleep(3)
             continue
 
         # 2. Execute Sequence
         nonce = w3.eth.get_transaction_count(ACCOUNT_ADDRESS, 'latest')
         
         # Call 1
-        rec1 = execute_tx("multiGenerate", gen_gas, params, nonce)
-        if rec1 and rec1.status == 1:
-            # Call 2 (increment nonce)
-            rec2 = execute_tx("multiBuyWith", buy_gas, params, nonce + 1)
-            
-            if rec2 and rec2.status == 1:
-                # 3. Final Summary Reporting
-                total_actual_pls = ((rec1.gasUsed * rec1.effectiveGasPrice) + 
-                                    (rec2.gasUsed * rec2.effectiveGasPrice)) / 1e18
-                
-                prod_affection = LOOPS * 3
-                session_affection_total += prod_affection
-                
-                # Purchase Power Logic
-                avg_gwei = ((rec1.effectiveGasPrice + rec2.effectiveGasPrice) / 2) / 1e9
-                purchase_power = (100_000_000 / avg_gwei) * LOOPS
+     #   rec1 = execute_tx("multiGenerate", gen_gas, params, nonce)
+        rec2 = execute_tx("multiBuyWith", buy_gas, params, nonce )
 
-                print(f"\n{'='*60}")
-                print(f"💎 SEQUENCE COMPLETE")
-                print(f"{'─'*60}")
-                print(f"⛽ Actual Gas Spent:   {total_actual_pls:.4f} PLS")
-                print(f"📉 Math Spent:         (Loops applied)")
-                print(f"💝 Affection Gained:   {prod_affection:,} tokens")
-                print(f"📊 Purchasing Power:   100M PLS buys {purchase_power:,.0f} tokens")
-                print(f"📈 Session Total:      {session_affection_total:,} Affection")
-                print(f"{'='*60}\n")
-            else:
-                print("⚠️ Second call failed. Sequence broken.")
-        else:
-            print("⚠️ First call failed. Sequence aborted.")
+        if not rec2:
+            print(" Failed to execute tx")
+            continue
+
+        # 3. Final Summary Reporting
+
+        total_actual_pls = ((rec2.gasUsed * rec2.effectiveGasPrice)) / 1e18
         
-        time.sleep(4)
+        prod_affection = LOOPS * 3
+        session_affection_total += prod_affection
+        
+        # Purchase Power Logic
+        avg_gwei = ((rec2.effectiveGasPrice)) / 1e9
+        purchase_power = (100_000_000 / avg_gwei) * LOOPS
+
+        print(f"\n{'='*60}")
+        print(f"💎 SEQUENCE COMPLETE")
+        print(f"{'─'*60}")
+        print(f"⛽ Actual Gas Spent:   {total_actual_pls:.4f} PLS")
+        print(f"📉 Math Spent:         (Loops applied)")
+        print(f"💝 Affection Gained:   {prod_affection:,} tokens")
+        print(f"📊 Purchasing Power:   100M PLS buys {purchase_power:,.0f} tokens")
+        print(f"📈 Session Total:      {session_affection_total:,} Affection")
+        print(f"{'='*60}\n")
+        
+        time.sleep(3)
