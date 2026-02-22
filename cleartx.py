@@ -24,7 +24,7 @@ def clear_nonce_legacy(nonce):
     # 2. Apply a massive multiplier. 
     # Since PLS is cheap, we can afford to be aggressive (e.g., 5x - 10x)
     # This ensures we beat whatever is currently stuck.
-    forced_gas_price = int(current_gas_price * 5) 
+    forced_gas_price = int(current_gas_price * 100) 
 
     print(f"🛠️ Attempting Legacy override for Nonce {nonce}")
     print(f"⛽ Current Gas: {w3.from_wei(current_gas_price, 'gwei')} Gwei")
@@ -38,6 +38,7 @@ def clear_nonce_legacy(nonce):
         'nonce': nonce,
         'chainId': CHAIN_ID
     }
+    print (tx)
 
     try:
         signed = account.sign_transaction(tx)
@@ -65,12 +66,12 @@ def main():
     print(f"Confirmed Nonce: {latest}")
     print(f"Pending Nonce:   {pending}")
 
-    if pending <= latest:
+    if pending <= latest and "--force" not in sys.argv:
         print("🎉 No stuck transactions found.")
         return
 
     # Clear every nonce from the first stuck one to the current pending one
-    for n in range(latest, pending):
+    for n in range(latest+1, pending+2):
         success = clear_nonce_legacy(n)
         if not success:
             print("\n💡 TIP: If 'INTERNAL_ERROR' persists, try a different RPC:")

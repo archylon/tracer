@@ -12,7 +12,6 @@ from web3.exceptions import TransactionNotFound, TimeExhausted
 # ------------------------------
 RPC_URL = os.environ.get("RPC_URL", "https://rpc.pulsechain.com")
 PRIVATE_KEY = os.environ.get("KEY")
-ACCOUNT_ADDRESS = Web3.to_checksum_address("0xCeC3cdcbaaD459b2b7bEe596eA70A5300E5Aa834")
 
 TOKEN_ADDRESS = Web3.to_checksum_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
 MULTIMATH_ADDRESS = Web3.to_checksum_address("0x3dF517a0FaA3fe70ae00698451997ae596a9A711")
@@ -29,7 +28,7 @@ if not PRIVATE_KEY:
     sys.exit(1)
 
 account = Account.from_key(PRIVATE_KEY)
-
+ACCOUNT_ADDRESS = account.address
 # ABIs
 ERC20_ABI = [
     {"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
